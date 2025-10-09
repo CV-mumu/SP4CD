@@ -1,6 +1,4 @@
 # SP4CD
-SP4CD: A Hierarchical Stripe Patch-Based Method for Change Detection in Remote Sensing Images
-# SP4CD
 The code will be available soon.  
 
 ## Overview
