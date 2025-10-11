@@ -84,10 +84,10 @@ def process_folder(folder_path, window_size=(64, 64), visualize=False):
     }
 
 
-# 🔽 主函数入口
+
 if __name__ == "__main__":
-    folder_path = r"/home/207lab/change_detection_datasets/DSIFN-CD-256/label"   # 替换为你自己的文件夹路径
-    window_size = (256, 128)                      # 窗口大小
+    folder_path = r"/home/207lab/change_detection_datasets/DSIFN-CD-256/label"  
+    window_size = (256, 128)                      
 
     result = process_folder(folder_path, window_size=window_size)
 
