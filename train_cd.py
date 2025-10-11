@@ -17,7 +17,7 @@ from misc.torchutils import get_scheduler, save_network
 
 if __name__ == '__main__':
     parser =argparse.ArgumentParser()
-    parser.add_argument('--config', type=str, default='/home-nv1/2024xlh/CDProject/config/whu_mamaba/whu_others.json',
+    parser.add_argument('--config', type=str, default='/CDProject/config/whu_mamaba/whu_others.json',
                         help='JSON file for configuration')
     parser.add_argument('--phase', type=str, default='train',
                         choices=['train', 'test'], help='Run either train(training + validation) or testing',)
@@ -377,3 +377,4 @@ if __name__ == '__main__':
                     message += '\n'
                 logger_test.info(message)
                 logger.info('End of testing...')
+
