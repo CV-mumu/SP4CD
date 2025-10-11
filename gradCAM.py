@@ -24,7 +24,7 @@ CONFIG = {
     # 模型配置
     "model": {
         "config_path": r"HWNet",
-        "checkpoint_path": r"/home-nv1/2024xlh/experiments/train/ablation/SYSU/SYSU-train-IPNet-CA_250826_101811/checkpoint/best_cd_model_gen.pth",
+        "checkpoint_path": r"/experiments/train/ablation/SYSU/SYSU-train-IPNet-CA_250826_101811/checkpoint/best_cd_model_gen.pth",
         "target_layers": [
             ["model.encoder1"],
             ["model.encoder2"],
@@ -47,7 +47,7 @@ CONFIG = {
     # CAM配置
     "cam": {
         "method": "EigenCAM",  # 支持的: GradCAM, GradCAM++, XGradCAM, EigenCAM, EigenGradCAM, LayerCAM
-        "base_save_dir": r"/home-nv1/2024xlh/grad-CAM/SYSU-eigencam/CA",
+        "base_save_dir": r"/grad-CAM/SYSU-eigencam/CA",
         "vis_results": False,
         "save_heatmap": True,
         "save_cam": True,
