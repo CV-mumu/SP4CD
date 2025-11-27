@@ -2,14 +2,51 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from typing import List, Tuple
-from .SimAM import SimAM
-nonlinearity = nn.SiLU()
 from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, selective_scan_ref
 import torch.nn as nn
 import torch
 import math
 from einops import repeat
+import timm
 
+def im2cswin(x, h_sp, w_sp):
+    b, c, h, w = x.shape
+    # b, c, h, w ==> b, c, h // h_sp, h_sp, w // w_sp, w_sp
+    x = x.view(b, c, h // h_sp, h_sp, w // w_sp, w_sp)
+    # b, c, h // h_sp, h_sp, w // w_sp, w_sp ==> b, h_sp, w_sp, c, h // h_sp, w // w_sp
+    x = x.permute(0, 3, 5, 1, 2, 4).contiguous()
+    # b, h_sp, w_sp, c, h // h_sp, w // w_sp ==> b * h_sp * w_sp, c, h // h_sp, w // w_sp
+    x = x.view(-1, c, h // h_sp, w // w_sp)
+    return x
+
+def cswin2im(x, h_sp, w_sp, b):
+    _, c, h, w = x.shape
+    #  b * h_sp * w_sp, c, h // h_sp, w // w_sp ==> b, h_sp, w_sp, c, h // h_sp, w // w_sp
+    x = x.view(b, h_sp, w_sp, c, h, w)
+    # b, h_sp, w_sp, c, h // h_sp, w // w_sp ==> b, c, h // h_sp, h_sp, w // w_sp, w_sp
+    x = x.permute(0, 3, 4, 1, 5, 2).contiguous()
+    # b, h_sp, w_sp, c, h // h_sp, w // w_sp ==>
+    x = x.view(b, c, h * h_sp, w * w_sp)
+    return x
+
+def autopad(k, p=None, d=1):  # kernel, padding, dilation
+    """Pad to 'same' shape outputs."""
+    if d > 1:
+        k = d * (k - 1) + 1 if isinstance(k, int) else [d * (x - 1) + 1 for x in k]  # actual kernel-size
+    if p is None:
+        p = k // 2 if isinstance(k, int) else [x // 2 for x in k]  # auto-pad
+    return p
+
+class LayerNorm2d(nn.Module):
+    def __init__(self, num_features, eps=1e-6):
+        super(LayerNorm2d, self).__init__()
+        self.layernorm = nn.LayerNorm(num_features, eps=eps)
+
+    def forward(self, x):
+        x = x.permute(0, 2, 3, 1)
+        x = self.layernorm(x)
+        x = x.permute(0, 3, 1, 2)
+        return x
 
 class SimAM(nn.Module):
     def __init__(self, e_lambda=1e-4):
@@ -35,14 +72,6 @@ class SimAM(nn.Module):
         att_weight = self.activaton(y)
         return att_weight
 
-class LN(nn.Module):
-    def __init__(self, c_channel,norm_layer=nn.LayerNorm):
-        super(LN, self).__init__()
-        self.ln = nn.LayerNorm(c_channel)
-
-    def forward(self,x):
-            x = self.ln(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
-            return x
 
 class SS2D(nn.Module):
     def __init__(
@@ -123,17 +152,13 @@ class SS2D(nn.Module):
             torch.rand(d_inner, **factory_kwargs) * (math.log(dt_max) - math.log(dt_min))
             + math.log(dt_min)
         ).clamp(min=dt_init_floor)
-        # Inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
         inv_dt = dt + torch.log(-torch.expm1(-dt))
         with torch.no_grad():
             dt_proj.bias.copy_(inv_dt)
-        # Our initialization would set all Linear.bias to zero, need to mark this one as _no_reinit
         dt_proj.bias._no_reinit = True
         return dt_proj
-
     @staticmethod
     def A_log_init(d_state, d_inner, copies=1, device=None, merge=True):
-        # S4D real initialization
         A = repeat(
             torch.arange(1, d_state + 1, dtype=torch.float32, device=device),
             "n -> d n",
@@ -150,13 +175,12 @@ class SS2D(nn.Module):
 
     @staticmethod
     def D_init(d_inner, copies=1, device=None, merge=True):
-        # D "skip" parameter
         D = torch.ones(d_inner, device=device)
         if copies > 1:
             D = repeat(D, "n1 -> r n1", r=copies)
             if merge:
                 D = D.flatten(0, 1)
-        D = nn.Parameter(D)  # Keep in fp32
+        D = nn.Parameter(D) 
         D._no_weight_decay = True
         return D
 
@@ -197,17 +221,13 @@ class SS2D(nn.Module):
         y = torch.transpose(y, dim0=1, dim1=2).contiguous().view(B, H, W, -1)
         return y
 
-
 class DAR(nn.Module):
     def __init__(self, in_channels):
         super(DAR, self).__init__()
         
         self.channel_H = nn.Conv2d(in_channels, in_channels, kernel_size=1, stride=1, padding=0)
         self.channel_W = nn.Conv2d(in_channels, in_channels, kernel_size=1, stride=1, padding=0)
-        
-        # self.spatial = nn.Conv2d(2, 1, kernel_size=7, stride=1, padding=3)
     def _swap_feature_blocks(self, feat1, feat2, num_splits=4, split_type='width'):
-        
         B, C, H, W = feat1.shape
         if split_type == 'width':
             assert W % num_splits == 0, "Width must be divisible by num_splits"
@@ -215,31 +235,24 @@ class DAR(nn.Module):
             assert H % num_splits == 0, "Height must be divisible by num_splits"
         else:
             raise ValueError("Invalid split_type")
-        
         time1 = []
         time2 = []
-
         if split_type == 'height':
-            # Step 1: Split both features along height dimension
             split_size = H // num_splits
             feat1_splits = torch.split(feat1, split_size, dim=2)
             feat2_splits = torch.split(feat2, split_size, dim=2)
-            
             for i in range(num_splits):
                 x_1, x_2 = self.channel_attention(feat1_splits[i], feat2_splits[i], mode='height')
                 time1.append(x_1)
                 time2.append(x_2)
             x_1 = torch.cat(time1, dim=2)
             x_2 = torch.cat(time2, dim=2)
-            
             x_final = x_1 + x_2
             
         elif split_type == 'width':
-            # Step 1: Split both features along width dimension
             split_size = W // num_splits
-            feat1_splits = torch.split(feat1, split_size, dim=3)  # list of 4 tensors
+            feat1_splits = torch.split(feat1, split_size, dim=3)
             feat2_splits = torch.split(feat2, split_size, dim=3)
-            
             for i in range(num_splits):
                 x_1, x_2 = self.channel_attention(feat1_splits[i], feat2_splits[i], mode='width')
                 time1.append(x_1)
@@ -255,7 +268,6 @@ class DAR(nn.Module):
         
         if mode == 'height':
             x = torch.cat([x_1, x_2], dim=2)
-            # x = torch.amax(x, dim=[2, 3], keepdim=True)
             x = torch.mean(x, dim=[2, 3], keepdim=True)
             
             x = self.channel_H(x)
@@ -265,47 +277,12 @@ class DAR(nn.Module):
         elif mode == 'width':
             x = torch.cat([x_1, x_2], dim=3)
             x = torch.mean(x, dim=[2, 3], keepdim=True)
-            # x = torch.amax(x, dim=[2, 3], keepdim=True)
             x = self.channel_W(x)
             x_1 = F.sigmoid(x) * x_1
             x_2 = F.sigmoid(x) * x_2
                 
         return x_1, x_2
             
-    # def spatial_attention(self, x_1, x_2, mode='height'):
-    #     if mode == 'height':
-    #         x = torch.cat([x_1, x_2], dim=1)
-    #         x_mean = torch.mean(x, dim=1, keepdim=True)
-    #         x_max = torch.max(x, dim=1, keepdim=True)[0]
-            
-    #         x_spatial = self.spatial(torch.cat([x_mean, x_max], dim=1))
-            
-    #         x_1 = x_1 * F.sigmoid(x_spatial)
-    #         x_2 = x_2 * F.sigmoid(x_spatial)
-            
-    #     elif mode == 'width':
-    #         x = torch.cat([x_1, x_2], dim=1)
-    #         x_mean = torch.mean(x, dim=1, keepdim=True)
-    #         x_max = torch.max(x, dim=1, keepdim=True)[0]
-            
-    #         x_spatial = self.spatial(torch.cat([x_mean, x_max], dim=1))
-            
-    #         x_1 = x_1 * F.sigmoid(x_spatial)
-    #         x_2 = x_2 * F.sigmoid(x_spatial)
-            
-    #     return x_1, x_2
-    
-    # def cbam_window(self, x_1, x_2, mode='height'):
-    #     if mode == 'height':
-    #         x_1, x_2 = self.channel_attention(x_1, x_2, mode='height')
-    #         x_1, x_2 = self.spatial_attention(x_1, x_2, mode='height')
-            
-    #     elif mode == 'width':
-    #         x_1, x_2 = self.channel_attention(x_1, x_2, mode='width')
-    #         x_1, x_2 = self.spatial_attention(x_1, x_2, mode='width')
-            
-    #     return x_1, x_2
-
     def forward(self, x_1, x_2):
         assert x_1.shape == x_2.shape, "Input tensors must have the same shape"
         B, C, H, W = x_1.shape
@@ -314,52 +291,6 @@ class DAR(nn.Module):
         x_final_W = self._swap_feature_blocks(x_1, x_2, num_splits=4, split_type='width')
         
         return x_final_H + x_final_W
-
-def im2cswin(x, h_sp, w_sp):
-    b, c, h, w = x.shape
-    # b, c, h, w ==> b, c, h // h_sp, h_sp, w // w_sp, w_sp
-    x = x.view(b, c, h // h_sp, h_sp, w // w_sp, w_sp)
-    # b, c, h // h_sp, h_sp, w // w_sp, w_sp ==> b, h_sp, w_sp, c, h // h_sp, w // w_sp
-    x = x.permute(0, 3, 5, 1, 2, 4).contiguous()
-    # b, h_sp, w_sp, c, h // h_sp, w // w_sp ==> b * h_sp * w_sp, c, h // h_sp, w // w_sp
-    x = x.view(-1, c, h // h_sp, w // w_sp)
-    return x
-
-
-def cswin2im(x, h_sp, w_sp, b):
-    _, c, h, w = x.shape
-    #  b * h_sp * w_sp, c, h // h_sp, w // w_sp ==> b, h_sp, w_sp, c, h // h_sp, w // w_sp
-    x = x.view(b, h_sp, w_sp, c, h, w)
-    # b, h_sp, w_sp, c, h // h_sp, w // w_sp ==> b, c, h // h_sp, h_sp, w // w_sp, w_sp
-    x = x.permute(0, 3, 4, 1, 5, 2).contiguous()
-    # b, h_sp, w_sp, c, h // h_sp, w // w_sp ==>
-    x = x.view(b, c, h * h_sp, w * w_sp)
-    return x
-
-
-def autopad(k, p=None, d=1):  # kernel, padding, dilation
-    """Pad to 'same' shape outputs."""
-    if d > 1:
-        k = d * (k - 1) + 1 if isinstance(k, int) else [d * (x - 1) + 1 for x in k]  # actual kernel-size
-    if p is None:
-        p = k // 2 if isinstance(k, int) else [x // 2 for x in k]  # auto-pad
-    return p
-
-
-
-class LayerNorm2d(nn.Module):
-    def __init__(self, num_features, eps=1e-6):
-        super(LayerNorm2d, self).__init__()
-        self.layernorm = nn.LayerNorm(num_features, eps=eps)
-
-    def forward(self, x):
-        # B, C, H, W -> B, H, W, C
-        x = x.permute(0, 2, 3, 1)
-        x = self.layernorm(x)
-        # B, H, W, C -> B, C, H, W
-        x = x.permute(0, 3, 1, 2)
-        return x
-
 
 class SP4CD_P(nn.Module):
     # 并行HW操作
@@ -430,16 +361,7 @@ class SP4CD_P(nn.Module):
         assert x1.shape == x2.shape, "Input tensors must have the same shape."
         B, C, H, W = x1.shape
         
-        
-        #########################################################################
-        ## 得到通道注意力
-        #########################################################################
         x_channels = self.dar(x1, x2)
-
-
-        #########################################################################
-        ## 得到空间注意力
-        #########################################################################
 
         # 得到融合时相信息
         x_concat = torch.abs(x2 - x1)
@@ -486,18 +408,8 @@ class SP4CD_P(nn.Module):
         x_spatial = x_h + x_w
 
         # # 不同时相信息整合
-        # 1. 1x1conv + 1x1conv
         x_ = self.mlp(self.channels_conv(x_channels) + self.spatial_conv(x_spatial))
-        
-        #2. add
-        x_ = x_channels + x_spatial
-        
-        # 3. concat + 1x1conv
-        x_ = self.concat_fusion(torch.cat([x_channels, x_spatial], dim=1))
-        
-        x_ = self.mlp(x_spatial)
-        x_ = self.channels_conv(x_channels)
-        
+    
         return x_channels
 
 
@@ -611,8 +523,6 @@ class SP4CD_S(nn.Module):
         x_spatial = x_w + x_h
         
         x_ = self.mlp(self.channels_conv(x_channels) + self.spatial_conv(x_spatial))
-        
-        x_ = x_channels
 
         return x_
     
@@ -679,12 +589,147 @@ class SP4CD_S(nn.Module):
         return x_
 
 
-if __name__ == '__main__':
-    model = SP4CD_P(in_channels=64, out_channels=64, h_sp=4, w_sp=4, mlp_ratio=4).cuda()
-    x1 = torch.randn(1, 64, 56, 56).cuda()
-    x2 = torch.randn(1, 64, 56, 56).cuda()
+nonlinearity = nn.SiLU()
+
+class DecoderBlock(nn.Module):
+    def __init__(self, in_channels, n_filters):
+        super(DecoderBlock, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels, in_channels // 4, 1)
+        self.norm1 = nn.BatchNorm2d(in_channels // 4)
+        # self.norm1 = LN(in_channels // 4)
+        self.relu1 = nonlinearity
+
+        self.deconv2 = nn.ConvTranspose2d(in_channels // 4, in_channels // 4, 3, stride=2, padding=1, output_padding=1)
+        self.norm2 = nn.BatchNorm2d(in_channels // 4)
+        # self.norm2 = LN(in_channels // 4)
+        self.relu2 = nonlinearity
+
+        self.conv3 = nn.Conv2d(in_channels // 4, n_filters, 1)
+        self.norm3 = nn.BatchNorm2d(n_filters)
+        # self.norm3 = LN(n_filters)
+        self.relu3 = nonlinearity
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.norm1(x)
+        x = self.relu1(x)
+        x = self.deconv2(x)
+        x = self.norm2(x)
+        x = self.relu2(x)
+        x = self.conv3(x)
+        x = self.norm3(x)
+        x = self.relu3(x)
+        return x
+
+class SP4CD(nn.Module):
+    def __init__(self, h_sp=[4, 4, 1, 1], w_sp=[4, 4, 1, 1], mlp_ratio=4, mode='baseline', mode_s='s1s2', nonlinearity=nn.SiLU()):
+        
+        super(SP4CD, self).__init__()
+        filters = [64, 128, 256, 512]
+        self.mode = mode
+        
+        if mode == 'series':
+            self.mode_s = mode_s
+            
+        
+        ## Backbone
+        convnext = timm.create_model('convnext_pico', pretrained=True, pretrained_cfg_overlay=dict(
+            file="/home/207lab/convnext_weights/convnext_pico.d1_in1k.bin"))
+
+        # Encoder部分
+        self.stem = convnext.stem
+        self.encoder1 = convnext.stages[0]
+        self.encoder2 = convnext.stages[1]
+        self.encoder3 = convnext.stages[2]
+        self.encoder4 = convnext.stages[3]
+
+        # difference modules
+        if self.mode == 'parallel':
+            self.dm0 = SP4CD_P(filters[0], filters[0], h_sp[0], w_sp[0], mlp_ratio, nonlinearity=nonlinearity)
+            self.dm1 = SP4CD_P(filters[1], filters[1], h_sp[1], w_sp[1], mlp_ratio, nonlinearity=nonlinearity)
+            self.dm2 = SP4CD_P(filters[2], filters[2], h_sp[2], w_sp[2], mlp_ratio, nonlinearity=nonlinearity)
+            self.dm3 = SP4CD_P(filters[3], filters[3], h_sp[3], w_sp[3], mlp_ratio, nonlinearity=nonlinearity)
+            print('using parallel')
+            
+        elif self.mode == 'series':
+            self.dm0 = SP4CD_S(filters[0], filters[0], h_sp[0], w_sp[0], mlp_ratio, mode_s=self.mode_s, nonlinearity=nonlinearity)
+            self.dm1 = SP4CD_S(filters[1], filters[1], h_sp[1], w_sp[1], mlp_ratio, mode_s=self.mode_s, nonlinearity=nonlinearity)
+            self.dm2 = SP4CD_S(filters[2], filters[2], h_sp[2], w_sp[2], mlp_ratio, mode_s=self.mode_s, nonlinearity=nonlinearity)
+            self.dm3 = SP4CD_S(filters[3], filters[3], h_sp[3], w_sp[3], mlp_ratio, mode_s=self.mode_s, nonlinearity=nonlinearity)
+            print('using series')
+            print(f'mode_s: {self.mode_s}')
+            
+        elif self.mode == 'baseline':
+            print('using baseline')
+            
+        else:
+            raise ValueError("Mode must be either 'parallel' or 'series'.")
+        
+        # Decoder部分
+        self.decoder1 = DecoderBlock(filters[0], 32)
+        self.decoder2 = DecoderBlock(filters[1], filters[0])
+        self.decoder3 = DecoderBlock(filters[2], filters[1])
+        self.decoder4 = DecoderBlock(filters[3], filters[2])
+        
+        self.final_conv = nn.Sequential(
+            nn.ConvTranspose2d(32, 32, 4, 2, 1),
+            nonlinearity,
+            nn.Conv2d(32, 32, 3, padding=1),
+            nonlinearity,
+            nn.Conv2d(32, 2, 3, padding=1)
+        )
+        
+    def forward(self, x1, x2):
+
+        # Encoder部分
+        x1 = self.stem(x1)
+        x2 = self.stem(x2)
+
+        x1_1 = self.encoder1(x1)
+        x2_1 = self.encoder1(x2)
+
+        x1_2 = self.encoder2(x1_1)
+        x2_2 = self.encoder2(x2_1)
+
+        x1_3 = self.encoder3(x1_2)
+        x2_3 = self.encoder3(x2_2)
+
+        x1_4 = self.encoder4(x1_3)
+        x2_4 = self.encoder4(x2_3)
+        
+
+        # difference modules
+        if self.mode in ['parallel', 'series']:
+            output_0 = self.dm0(x1_1, x2_1) + x1_1 + x2_1  # Add the original input to the output
+            output_1 = self.dm1(x1_2, x2_2) + x1_2 + x2_2
+            output_2 = self.dm2(x1_3, x2_3) + x1_3 + x2_3
+            output_3 = self.dm3(x1_4, x2_4) + x1_4 + x2_4
+        
+        # baseline
+        elif self.mode == 'baseline':       
+            output_0 = 0
+            output_1 = 0
+            output_2 = 0
+            output_3 = x1_4 + x2_4
+            
+        d4 = self.decoder4(output_3)
+        d3 = self.decoder3(d4 + output_2) 
+        d2 = self.decoder2(d3 + output_1)
+        d1 = self.decoder1(d2 + output_0)
+
+        output = self.final_conv(d1)
+
+        return output
+
+if __name__ == "__main__":
     
+    model = SP4CD(mode='parallel', mode_s='s1s2', nonlinearity=nonlinearity).cuda()
+    x1 = torch.randn(1, 3, 256, 256).cuda()
+    x2 = torch.randn(1, 3, 256, 256).cuda()
+    output = model(x1, x2)
+    print(output.shape)  # Should be [1, 2, 56, 56] if the final conv is set correctly
+
     from thop import profile
-    flops, params = profile(model, inputs=(x1, x2), verbose=False)
-    print(f'FLOPs: {flops / 1e9:.2f} G')
-    print(f'Params: {params / 1e6:.2f} M')
+    flops, params = profile(model, inputs=(x1, x2))
+    print(f"FLOPs: {(flops) / 1e9} G")
+    print(f"Params: {(params) / 1e6} M")
